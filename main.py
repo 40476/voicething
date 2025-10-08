@@ -1,6 +1,6 @@
 #!/usr/bin/python3
-# import faulthandler
-# faulthandler.enable()
+import faulthandler
+faulthandler.enable()
 import curses, time, queue, threading, numpy as np, textwrap, subprocess, signal, wave, tempfile, whisper, pyaudio, torch, os
 from datetime import datetime
 from dbus_next.aio import MessageBus
@@ -10,7 +10,7 @@ from dbus_next.service import ServiceInterface, method
 settings = {
     "model": "small",
     "language": "en",
-    "audio_device":14,
+    "audio_device":None,
     "speak": True,
     
 }
@@ -41,6 +41,19 @@ def log(msg):
     log_q.put(f"[{timestamp}] {msg}")
 
 # =============== AUDIO ===============
+def get_supported_rate(pa, device_id):
+    # Try common rates in descending preference
+    for rate in [16000, 44100, 48000.0, 48000, 32000, 22050, 192000]:
+        try:
+            if pa.is_format_supported(rate,
+                                      input_device=device_id,
+                                      input_channels=1,
+                                      input_format=pyaudio.paInt16):
+                return rate
+        except ValueError:
+            continue
+    return None  # No supported rate found
+
 class PTTInterface(ServiceInterface):
     def __init__(self):
         super().__init__('com.speak.PTT')
@@ -79,7 +92,6 @@ def list_audio_devices():
         if info["maxInputChannels"] > 0:
             input_devices.append((i, info["name"]))
     return input_devices
-
 
 def device_selector(win, devices):
     selected_index = 0
@@ -146,6 +158,14 @@ def audio_stream_worker():
 
             # Verify device is input-capable
             info = pa.get_device_info_by_index(device_id)
+            # supported_rate = get_supported_rate(pa, device_id)
+            # if not supported_rate:
+            # log(f"[audio] No supported sample rate for device {device_id}")
+            # time.sleep(1)
+            # continue
+            # settings["sample_rate"] = supported_rate
+
+
             if info["maxInputChannels"] == 0:
                 log(f"[audio] Device {device_id} has no input channels — retrying")
                 time.sleep(0.5)
@@ -244,6 +264,11 @@ def transcribe_worker(model, transcript_win=None):
                     audio_np = np.where(np.abs(audio_np) < threshold, 0, audio_np)
 
                 audio_np /= 32768.0  # Normalize
+
+                # Resample to 16000 Hz if needed
+                input_rate = settings.get("sample_rate", 16000)
+                if input_rate != 16000:
+                    audio_np = resampy.resample(audio_np, input_rate, 16000)
 
                 if np.max(np.abs(audio_np)) < 0.01:
                     log("[transcribe] Quiet buffer — skipping")
