@@ -41,18 +41,15 @@ def log(msg):
     log_q.put(f"[{timestamp}] {msg}")
 
 # =============== AUDIO ===============
-def get_supported_rate(pa, device_id):
-    # Try common rates in descending preference
-    for rate in [16000, 44100, 48000.0, 48000, 32000, 22050, 192000]:
-        try:
-            if pa.is_format_supported(rate,
-                                      input_device=device_id,
-                                      input_channels=1,
-                                      input_format=pyaudio.paInt16):
-                return rate
-        except ValueError:
-            continue
-    return None  # No supported rate found
+def play_tone(frequency=440, duration=0.05, sink="TTS_voice"):
+    try:
+        cmd = f"play -n synth {duration} sine {frequency} vol 0.02"
+        if sink:
+            cmd += f" | pacat --client-name=TonePlayer --device={sink}"
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"[tone] Error: {e}")
+
 
 class PTTInterface(ServiceInterface):
     def __init__(self):
@@ -63,11 +60,12 @@ class PTTInterface(ServiceInterface):
         settings["ptt_active"] = not settings.get("ptt_active", False)
         volume_path = os.path.expanduser("~/.local/state/speakvolumerc")
         if settings["ptt_active"]:
-            
             subprocess.call(f"echo -n \"$(awk -F'[][]' '/Left:/ {{ print $2 }}' <(amixer sget Master))\" > {volume_path}", shell=True)
             subprocess.call("amixer set Master 20%", shell=True)
+            play_tone(600, 0.3)  # Start tone
         else:
             subprocess.call(f"amixer set Master $(cat {volume_path})",shell=True)
+            play_tone(440, 0.2)  # Processing tone
         log(f"[ptt] {'Activated' if settings['ptt_active'] else 'Deactivated'}")
         return "PTT toggled"
 
@@ -227,6 +225,7 @@ def transcribe_worker(model, transcript_win=None):
     torch.backends.cudnn.enabled = False
     frames = []
     was_recording = False
+    last_beep_time = 0
 
     log("[transcribe] Ready")
 
@@ -236,6 +235,9 @@ def transcribe_worker(model, transcript_win=None):
             ptt_active = settings.get("ptt_active", False)
 
             if ptt_active:
+                if time.time() - last_beep_time > 1:
+                    play_tone(700, 0.1)
+                    last_beep_time = time.time()
                 if not was_recording:
                     log("[transcribe] PTT activated — starting buffer")
                     was_recording = True
@@ -289,6 +291,7 @@ def transcribe_worker(model, transcript_win=None):
                         timestamp = datetime.now().strftime("[%H:%M:%S]")
                         full_text = f"{timestamp} {text}"
                         log(f"[transcribe] {full_text}")
+                        play_tone(1040, 0.2)  # Done tone
 
                         # Write to transcript log with wrapping
                         if transcript_log is not None:
