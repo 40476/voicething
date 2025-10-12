@@ -1,23 +1,55 @@
 #!/usr/bin/python3
 import faulthandler
 faulthandler.enable()
-import curses, time, queue, threading, numpy as np, textwrap, subprocess, signal, wave, tempfile, whisper, pyaudio, torch, os
+import curses, time, queue, threading, numpy as np, textwrap, subprocess, signal, wave, tempfile, whisper, pyaudio, torch, os, json
 from datetime import datetime
 from dbus_next.aio import MessageBus
 from dbus_next.service import ServiceInterface, method
+from pathlib import Path
 
-# =============== SETTINGS ===============
-settings = {
+# =============== CONFIG PATHS ===============
+CONFIG_DIR = Path.home() / ".local/share/voicething"
+SOUNDS_DIR = CONFIG_DIR / "sounds"
+CONFIG_FILE = CONFIG_DIR / "voicething.conf"
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
+
+# =============== DEFAULT SETTINGS ===============
+default_settings = {
     "model": "small",
     "language": "en",
-    "audio_device":None,
+    "audio_device": None,
     "speak": True,
-    
+    "sound_emojis": {}
 }
+
+# Load or create config
+if CONFIG_FILE.exists():
+    try:
+        settings = json.loads(CONFIG_FILE.read_text())
+        # Merge with defaults for missing keys
+        for key in default_settings:
+            if key not in settings:
+                settings[key] = default_settings[key]
+    except:
+        settings = default_settings.copy()
+        CONFIG_FILE.write_text(json.dumps(settings, indent=2))
+else:
+    settings = default_settings.copy()
+    CONFIG_FILE.write_text(json.dumps(settings, indent=2))
+
 setting_keys = list(settings.keys())
 selected_index = 0
 should_run = True
 torch.backends.cudnn.enabled = False
+
+# =============== SOUNDBOARD STATE ===============
+# Add to soundboard state initialization
+soundboard_visible = True
+sound_files = []
+sound_selected = 0
+sound_scroll = 0
+last_play_time = 0
 
 # =============== STATE ===============
 transcript_log = []
@@ -35,6 +67,47 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 
+# ================ SOUND PLAYBACK ================
+def play_sound(filename):
+    global last_play_time
+    current_time = time.time()
+    
+    # 1-second cooldown check
+    if current_time - last_play_time < 1.0:
+        return
+        
+    last_play_time = current_time
+
+    """Play sound through both TTS voice and system audio"""
+    filepath = SOUNDS_DIR / filename
+    sound_name = os.path.splitext(filename)[0].replace("_", " ")
+    
+    try:
+        subprocess.Popen([
+            "paplay", "--device=TTS_voice", "--volume=80000", filepath
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+    except Exception as e:
+        log(f"[sound] Error: {e}")
+
+
+# =============== HELPERS ===============
+def handle_mouse_event(win):
+    try:
+        _, mx, my, _, _ = curses.getmouse()
+        win_y = my - win.getbegyx()[0]
+        btn_index = (win_y - 1) // 3  # Convert Y to button index
+        sound_index = sound_scroll + btn_index
+        
+        if 0 <= sound_index < len(sound_files):
+            return sound_index
+        return None
+    except:
+        return None
+
+def save_config():
+    CONFIG_FILE.write_text(json.dumps(settings, indent=2))
+
 # =============== LOGGING ===============
 def log(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -50,7 +123,28 @@ def play_tone(frequency=440, duration=0.05, sink="TTS_voice"):
     except Exception as e:
         log(f"[tone] Error: {e}")
 
+def edit_sound_emoji(idx):
+    filename = sound_files[idx]
+    curses.echo()
+    
+    # Create editor window
+    h, w = curses.LINES, curses.COLS
+    edit_win = curses.newwin(3, 40, h//2-1, w//2-20)
+    edit_win.border()
+    edit_win.addstr(0, 2, " EDIT EMOJI ")
+    edit_win.addstr(1, 2, f"{filename}: ")
+    
+    # Get new emoji
+    edit_win.refresh()
+    emoji = edit_win.getstr(1, len(filename) + 4, 3).decode().strip()
+    curses.noecho()
+    
+    if emoji:
+        settings["sound_emojis"][filename] = emoji
+        save_config()
+        log(f"Updated emoji for {filename} → {emoji}")
 
+# =============== PTT VIA DBUS ===============
 class PTTInterface(ServiceInterface):
     def __init__(self):
         super().__init__('com.speak.PTT')
@@ -102,16 +196,14 @@ def device_selector(win, devices):
         win.addstr(0, 2, " SELECT AUDIO DEVICE ")
 
         h, w = win.getmaxyx()
-        visible_height = h - 2  # room for borders
+        visible_height = h - 2
         max_offset = max(0, len(devices) - visible_height)
 
-        # Scroll logic
         if selected_index < scroll_offset:
             scroll_offset = selected_index
         elif selected_index >= scroll_offset + visible_height:
             scroll_offset = selected_index - visible_height + 1
 
-        # Show visible chunk
         for i in range(visible_height):
             idx = scroll_offset + i
             if idx >= len(devices):
@@ -128,8 +220,10 @@ def device_selector(win, devices):
             selected_index -= 1
         elif key == curses.KEY_DOWN and selected_index < len(devices) - 1:
             selected_index += 1
-        elif key in (10, 13):  # Enter
+        elif key in (10, 13):
             return selected_index + 1
+        elif key == 27:  # ESC
+            return None
 
 def audio_stream_worker():
     pa = pyaudio.PyAudio()
@@ -140,12 +234,10 @@ def audio_stream_worker():
         try:
             device_id = settings.get("audio_device")
 
-            # Wait until a device is selected
             if device_id is None:
                 time.sleep(0.5)
                 continue
 
-            # If the selected device has changed, reset stream
             if previous_device != device_id:
                 previous_device = device_id
                 if stream:
@@ -154,22 +246,12 @@ def audio_stream_worker():
                     stream.close()
                     stream = None
 
-            # Verify device is input-capable
             info = pa.get_device_info_by_index(device_id)
-            # supported_rate = get_supported_rate(pa, device_id)
-            # if not supported_rate:
-            # log(f"[audio] No supported sample rate for device {device_id}")
-            # time.sleep(1)
-            # continue
-            # settings["sample_rate"] = supported_rate
-
-
             if info["maxInputChannels"] == 0:
                 log(f"[audio] Device {device_id} has no input channels — retrying")
                 time.sleep(0.5)
                 continue
 
-            # Lazy open stream if not already active
             if stream is None:
                 log(f"[audio] Opening stream on device {device_id}")
                 stream = pa.open(
@@ -183,11 +265,8 @@ def audio_stream_worker():
                 stream.start_stream()
                 log(f"[audio] Stream started on {info['name']}")
 
-            # Add your stream reading logic here (e.g., stream.read() → audio_q.put())
-            # Example placeholder:
             data = stream.read(CHUNK, exception_on_overflow=False)
             audio_q.put(data)
-
             time.sleep(0.01)
 
         except Exception as e:
@@ -201,11 +280,12 @@ def audio_stream_worker():
 # =============== SPEAK ===============
 def speak(text):
     try:
-        proc = subprocess.Popen(["espeak", "-d", "TTS_voice", text],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True)
-        child_procs.append(proc)
+        if settings.get("speak", True):
+            proc = subprocess.Popen(["espeak", "-s", "150", "-d", "TTS_voice", text],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    text=True)
+            child_procs.append(proc)
     except Exception as e:
         log(f"[speak error] {e}")
 
@@ -241,15 +321,13 @@ def transcribe_worker(model, transcript_win=None):
                 if not was_recording:
                     log("[transcribe] PTT activated — starting buffer")
                     was_recording = True
-                    time.sleep(0.5)  # Optional delay
+                    time.sleep(0.5)
                 frames.append(np.frombuffer(data, dtype=np.int16))
 
             elif was_recording:
-                # PTT released — process buffer
                 was_recording = False
                 log("[transcribe] PTT released — processing buffer")
 
-                # Flush audio queue to prevent overlap
                 with audio_q.mutex:
                     audio_q.queue.clear()
 
@@ -257,7 +335,6 @@ def transcribe_worker(model, transcript_win=None):
                     log("[transcribe] Buffer empty — skipping")
                     continue
 
-                # Convert and clean buffer
                 audio_np = np.hstack(frames).astype(np.float32)
                 frames = []
 
@@ -265,9 +342,8 @@ def transcribe_worker(model, transcript_win=None):
                     threshold = 0.02
                     audio_np = np.where(np.abs(audio_np) < threshold, 0, audio_np)
 
-                audio_np /= 32768.0  # Normalize
+                audio_np /= 32768.0
 
-                # Resample to 16000 Hz if needed
                 input_rate = settings.get("sample_rate", 16000)
                 if input_rate != 16000:
                     audio_np = resampy.resample(audio_np, input_rate, 16000)
@@ -276,7 +352,6 @@ def transcribe_worker(model, transcript_win=None):
                     log("[transcribe] Quiet buffer — skipping")
                     continue
 
-                # Save to temp WAV
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
                     with wave.open(f.name, "w") as wf:
                         wf.setnchannels(1)
@@ -291,16 +366,13 @@ def transcribe_worker(model, transcript_win=None):
                         timestamp = datetime.now().strftime("[%H:%M:%S]")
                         full_text = f"{timestamp} {text}"
                         log(f"[transcribe] {full_text}")
-                        play_tone(1040, 0.2)  # Done tone
+                        play_tone(1040, 0.2)
 
-                        # Write to transcript log with wrapping
                         if transcript_log is not None:
                           timestamp = datetime.now().strftime("[%H:%M:%S]")
                           full_text = f"{timestamp} {text}"
                           transcript_log.append(full_text)
 
-
-                        # Speak the result if enabled
                         speak(text)
 
         except Exception as e:
@@ -308,7 +380,9 @@ def transcribe_worker(model, transcript_win=None):
 
 # =============== UI ===============
 def update_settings(win):
-    win.clear(); win.box(); win.addstr(0, 2, " SETTINGS ")
+    win.clear()
+    win.box()
+    win.addstr(0, 2, " SETTINGS ")
     for i, key in enumerate(setting_keys):
         val = str(settings[key])
         line = f"{key:<14}: {val}"
@@ -322,17 +396,32 @@ def update_settings(win):
 
 def update_logs(win):
     global log_scroll
-    h, w = win.getmaxyx(); win.clear(); win.box(); win.addstr(0, 2, " LOGS ")
+    h, w = win.getmaxyx()
+    win.clear()
+    win.box()
+    win.addstr(0, 2, " LOGS ")
+    
     while not log_q.empty():
         log_lines.append(log_q.get())
-        if len(log_lines) > MAX_LOG_LINES: log_lines.pop(0)
-    lines = log_lines[-(h - 2 + log_scroll):-log_scroll] if log_scroll else log_lines[-(h - 2):]
+        if len(log_lines) > MAX_LOG_LINES: 
+            log_lines.pop(0)
+    
+    visible_lines = []
+    if log_scroll > 0:
+        start_idx = min(log_scroll, len(log_lines) - 1)
+        visible_lines = log_lines[-start_idx:]
+    else:
+        visible_lines = log_lines[-h + 2:]
+    
     row = 1
-    for idx, line in enumerate(lines):
-        for wrapped in textwrap.wrap(line, w - 4):
-            if row >= h - 1: break
-            win.attrset(curses.color_pair(1 if row % 2 == 0 else 2))
-            win.addstr(row, 2, wrapped); row += 1
+    for line in visible_lines:
+        wrapped = textwrap.wrap(line, w - 4)
+        for wrapped_line in wrapped:
+            if row >= h - 1: 
+                break
+            win.attrset(curses.color_pair(1))
+            win.addstr(row, 2, wrapped_line)
+            row += 1
     win.refresh()
 
 def update_transcript(win):
@@ -342,23 +431,109 @@ def update_transcript(win):
     win.addstr(0, 2, " TRANSCRIPT ")
 
     wrapped_lines = []
-    for line in transcript_log:
+    for line in transcript_log[-MAX_LOG_LINES:]:
         wrapped = textwrap.wrap(line, width=w - 4)
         wrapped_lines.extend(wrapped)
 
-    visible_lines = wrapped_lines[-(h - 2):]
+    visible_count = h - 2
+    visible_lines = wrapped_lines[-visible_count:] if len(wrapped_lines) > visible_count else wrapped_lines
+
     for idx, line in enumerate(visible_lines):
-        color = curses.color_pair(1 if idx % 2 == 0 else 2)
-        win.attrset(color)
-        win.addstr(idx + 1, 2, line)
+        if idx < h - 2:
+            color = curses.color_pair(1 if idx % 2 == 0 else 2)
+            win.attrset(color)
+            win.addstr(idx + 1, 2, line)
 
     win.refresh()
 
+# ================ SOUNDBOARD UI ================
+def update_soundboard(win):
+    global sound_files, sound_scroll, sound_selected
+    try:
+        h, w = win.getmaxyx()
+        
+        # Early return if window too small
+        if h < 4 or w < 10:
+            win.addstr(1, 2, "Window too small")
+            win.refresh()
+            return
+            
+        win.clear()
+        win.border()
+        win.addstr(0, 2, " SOUNDBOARD [S] (▲/▼ scroll) ")
+
+        num_items = len(sound_files)
+        btn_h = 3  # Fixed button height
+        visible_btns = max(1, (h - 2) // btn_h)
+        max_scroll = max(0, num_items - visible_btns)
+        
+        # ================== CRITICAL SCROLL FIX ==================
+        sound_selected = max(0, min(sound_selected, num_items - 1 if num_items > 0 else 0))
+        
+        # Keep selection visible
+        if num_items > 0:
+            if sound_selected < sound_scroll:
+                sound_scroll = max(0, sound_selected)
+            elif sound_selected >= sound_scroll + visible_btns:
+                sound_scroll = min(max_scroll, sound_selected - visible_btns + 1)
+        sound_scroll = max(0, min(sound_scroll, max_scroll))
+
+        # Draw header/no sounds message
+        if num_items == 0:
+            win.addstr(1, 2, " ➕ Add sounds to ~/.local/share/voicething/sounds")
+            win.refresh()
+            return
+            
+        # Draw buttons
+        for i in range(visible_btns):
+            idx = sound_scroll + i
+            if idx >= num_items:
+                break
+                
+            filename = sound_files[idx]
+            emoji = settings["sound_emojis"].get(filename, "🔊")
+            name = os.path.splitext(filename)[0][:30]
+            
+            # Calculate button position
+            btn_top = i * btn_h + 1
+            
+            # Skip if bottom exceeds window
+            if btn_top + btn_h - 1 >= h:
+                break
+                
+            # Selection highlighting
+            is_selected = idx == sound_selected
+            color_id = 2 if is_selected else 1
+            win.attrset(curses.color_pair(color_id))
+            
+            # Draw button box
+            win.addstr(btn_top, 2, "┌" + "─"*(w-6) + "┐")
+            text_line = f"│ {emoji} {name.center(w-6)[2:]} "[:w-2]
+            win.addstr(btn_top+1, 2, text_line + "│".rjust(w-len(text_line)-2))
+            win.addstr(btn_top+2, 2, "└" + "─"*(w-6) + "┘")
+
+        win.refresh()
+    except Exception as e:
+        log(f"[SOUNDBOARD] {str(e)[:30]}")
+
+def safe_addstr(win, y, x, text):
+    """Safely write text to window coordinates"""
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x < 0 or x >= max_x - 2:
+        return
+    text = text[:max_x - x - 1]
+    try:
+        win.addstr(y, x, text)
+    except:
+        pass  # Ignore edge write errors
 
 def update_command(win):
-    win.clear(); win.box(); win.addstr(1, 2, " LAUNCH COMMAND ")
+    win.clear()
+    win.box()
+    win.addstr(1, 2, " LAUNCH COMMAND ")
     cmd = f"python3 main.py --model {settings['model']}"
-    win.addstr(2, 2, cmd[:win.getmaxyx()[1] - 4]); win.refresh()
+    win.addstr(2, 2, cmd[:win.getmaxyx()[1] - 4])
+    win.refresh()
 
 def edit_setting(win):
     global selected_index
@@ -367,15 +542,17 @@ def edit_setting(win):
     if key == "speak":
         settings["speak"] = not settings["speak"]
         log(f"Speech {'enabled' if settings['speak'] else 'disabled'}")
+        save_config()
 
     elif key == "audio_device":
         devices = list_audio_devices()
-        
-
+        dev_names = [f"{idx}: {name}" for idx, name in devices]
         try:
-            sel_index = int(device_selector(win,devices)) - 1
-            settings["audio_device"] = devices[sel_index][0]  # PyAudio index
-            log(f"[audio] Selected device: {devices[sel_index][1]}")
+            sel_index = device_selector(win, dev_names)
+            if sel_index is not None:
+                settings["audio_device"] = devices[sel_index][0]
+                log(f"[audio] Selected device: {devices[sel_index][1]}")
+                save_config()
         except Exception as e:
             log(f"[audio] Invalid selection: {e}")
 
@@ -388,9 +565,9 @@ def edit_setting(win):
         try:
             settings[key] = float(val) if key == "buffer_seconds" else val
             log(f"[settings] {key} → {settings[key]}")
+            save_config()
         except Exception as e:
             log(f"[settings] Error: {e}")
-
 
 def handle_sigint(sig, frame):
     global should_run
@@ -401,62 +578,132 @@ def cleanup_children():
     if child_procs:
         log("Cleaning up child processes...")
         for proc in child_procs:
-            try: proc.terminate()
-            except: pass
+            try: 
+                proc.terminate()
+                proc.wait(timeout=0.5)
+            except: 
+                pass
     log("All child processes cleaned up.")
 
 def main(stdscr):
     global selected_index, log_scroll, should_run
-    curses.curs_set(0); curses.start_color()
+    global soundboard_visible, sound_selected, sound_files
+    
+    def final_cleanup():
+        cleanup_children()
+        save_config()
+        log("Config saved")
+        os._exit(0)  # Force clean exit
+    
+    signal.signal(signal.SIGINT, lambda s, f: final_cleanup())
+    
+    curses.curs_set(0)
+    curses.start_color()
     curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)
     curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)
     curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-    h, w = stdscr.getmaxyx(); half = w // 2
-    settings_win   = curses.newwin(len(setting_keys) + 6, half, 0, 0)
-    log_win        = curses.newwin(h - settings_win.getmaxyx()[0] - 5, half, settings_win.getmaxyx()[0], 0)
-    cmd_win        = curses.newwin(5, half, h - 5, 0)
-    transcript_win = curses.newwin(h, w - half, 0, half)
+    
+    h, w = stdscr.getmaxyx()
+    half = w // 2
+    
+    # Window initialization
+    settings_win = curses.newwin(12, half, 0, 0)
+    log_win = curses.newwin(h - 17, half, 12, 0)
+    cmd_win = curses.newwin(5, half, h - 5, 0)
+    transcript_win = curses.newwin(h - 2, w - half, 0, half)
+    soundboard_win = None
+    
+    sound_files = sorted([f for f in os.listdir(SOUNDS_DIR) if f.endswith(('.wav', '.mp3'))])
     
     start_ptt_listener()
     threading.Thread(target=load_model_async, daemon=True).start()
     threading.Thread(target=audio_stream_worker, daemon=True).start()
     log("[init] Threads started.")
 
-    stdscr.nodelay(True); stdscr.timeout(100)
+    stdscr.nodelay(True)
+    stdscr.timeout(100)
+    
     try:
         while should_run:
+            if soundboard_visible:
+                # Update window sizes when soundboard is visible
+                transcript_height = h // 2
+                transcript_win.resize(transcript_height, w - half)
+                transcript_win.mvwin(0, half)
+                update_transcript(transcript_win)
+                
+                if soundboard_win is None:
+                    soundboard_win = curses.newwin(h - transcript_height - 1, w - half, transcript_height, half)
+                update_soundboard(soundboard_win)
+            else:
+                transcript_win.resize(h - 2, w - half)
+                transcript_win.mvwin(0, half)
+                update_transcript(transcript_win)
+                
+            # Update other UI components
             update_settings(settings_win)
-            update_transcript(transcript_win)
             update_logs(log_win)
             update_command(cmd_win)
+            
             time.sleep(0.05)
             key = stdscr.getch()
+            
             if key != -1:
-                if key == curses.KEY_UP: selected_index = max(0, selected_index - 1)
-                elif key == curses.KEY_DOWN: selected_index = min(len(setting_keys) - 1, selected_index + 1)
-                elif key == ord('\n') or key == ord(' '): edit_setting(settings_win)
-                elif key == curses.KEY_PPAGE: log_scroll = min(MAX_LOG_LINES, log_scroll + 1)
-                elif key == curses.KEY_NPAGE: log_scroll = max(0, log_scroll - 1)
-                elif key == ord('s'):
-                    with open("transcript.txt", "w") as f:
-                        f.write("\n".join(transcript_log))
-                    log("Transcript saved.")
-                elif key == ord('q'):
-                    should_run = False
-                    log("Quitting...")
-                    cleanup_children()
-                    hujgkvsdhjbgkhjdfhjkdfshjjhklzzgjhklgfzjhk
-                    break
-
+                if soundboard_visible:
+                    # Soundboard navigation
+                    if key == curses.KEY_UP:
+                        sound_selected = max(0, sound_selected - 1)
+                    elif key == curses.KEY_DOWN:
+                        sound_selected = min(len(sound_files) - 1, sound_selected + 1)
+                    elif key in (10, 13):  # Enter
+                        if sound_files:
+                            play_sound(sound_files[sound_selected])
+                    elif key == ord('s'):
+                        soundboard_visible = False
+                    elif key == curses.KEY_MOUSE and soundboard_visible and soundboard_win:
+                        selected_idx = handle_mouse_event(soundboard_win)  # Removed extra args
+                        if selected_idx is not None:
+                            sound_selected = selected_idx
+                            play_sound(sound_files[sound_selected])
+                    elif key == ord('e') and soundboard_visible:
+                        if sound_files:
+                            edit_sound_emoji(sound_selected)
+                else:
+                    # Main navigation
+                    if key == curses.KEY_UP:
+                        selected_index = max(0, selected_index - 1)
+                    elif key == curses.KEY_DOWN:
+                        selected_index = min(len(setting_keys) - 1, selected_index + 1)
+                    elif key == ord('\n') or key == ord(' '):
+                        edit_setting(settings_win)
+                    elif key == curses.KEY_PPAGE:
+                        log_scroll = min(MAX_LOG_LINES, log_scroll + 1)
+                    elif key == curses.KEY_NPAGE:
+                        log_scroll = max(0, log_scroll - 1)
+                    elif key == ord('t'):
+                        with open("transcript.txt", "w") as f:
+                            f.write("\n".join(transcript_log))
+                        log("Transcript saved.")
+                    elif key == ord('s'):
+                        # Add this to your 'S' key handler
+                        sound_files = sorted([f for f in os.listdir(SOUNDS_DIR) if f.endswith(('.wav', '.mp3'))])
+                        soundboard_visible = True
+                        sound_selected = 0
+                    elif key == ord('q'):
+                        should_run = False
+                        log("Quitting...")
+            
+            # Start transcribe worker when ready
             if model_ready.is_set() and not any(t.name == "transcriber" for t in threading.enumerate()):
                 threading.Thread(target=transcribe_worker,
-                                  args=(model, transcript_win),
-                                  daemon=True,
-                                  name="transcriber").start()
+                                args=(model, transcript_win),
+                                daemon=True,
+                                name="transcriber").start()
     finally:
-        log("Shutting down UI...")
-        cleanup_children()
+        final_cleanup()
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, handle_sigint)
-    curses.wrapper(main)
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        print("\nExiting...")
