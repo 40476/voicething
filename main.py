@@ -94,15 +94,43 @@ def play_sound(filename):
 # =============== HELPERS ===============
 def handle_mouse_event(win):
     try:
-        _, mx, my, _, _ = curses.getmouse()
-        win_y = my - win.getbegyx()[0]
-        btn_index = (win_y - 1) // 3  # Convert Y to button index
-        sound_index = sound_scroll + btn_index
-        
+        # Get mouse event details
+        _, mx, my, _, btn_state = curses.getmouse()
+
+        # Only allow left mouse button presses
+        if not (btn_state & curses.BUTTON1_PRESSED):
+            return None
+
+        # Get window boundaries
+        win_start_y, win_start_x = win.getbegyx()
+        win_height, win_width = win.getmaxyx()
+
+        # Check if click is INSIDE the window
+        if not (win_start_x <= mx < win_start_x + win_width and
+                win_start_y <= my < win_start_y + win_height):
+            return None
+
+        # Convert to window coordinates
+        rel_y = my - win_start_y
+        rel_x = mx - win_start_x
+
+        # Only process clicks in CONTENT AREA (inside borders)
+        if not (1 <= rel_x < win_width - 1 and 1 <= rel_y < win_height - 1):
+            return None
+
+        # Calculate clicked button row (each takes 3 lines)
+        button_row = (rel_y - 1) // 3  # Remove top border offset
+
+        # Calculate sound index based on scroll
+        sound_index = sound_scroll + button_row
+
+        # Validate index range
         if 0 <= sound_index < len(sound_files):
             return sound_index
+        
         return None
-    except:
+    except Exception as e:
+        log(f"[Mouse] Error: {e}")
         return None
 
 def save_config():
