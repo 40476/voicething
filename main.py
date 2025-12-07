@@ -1,7 +1,9 @@
 #!/usr/bin/python3
 import faulthandler
+
+from matplotlib import text
 faulthandler.enable()
-import curses, time, queue, threading, numpy as np, textwrap, subprocess, signal, wave, tempfile, whisper, pyaudio, torch, os, json
+import curses, time, librosa, queue, threading, numpy as np, textwrap, subprocess, signal, wave, tempfile, whisper, pyaudio, torch, os, json
 from datetime import datetime
 from dbus_next.aio import MessageBus
 from dbus_next.service import ServiceInterface, method
@@ -249,7 +251,7 @@ def device_selector(win, devices):
         elif key == curses.KEY_DOWN and selected_index < len(devices) - 1:
             selected_index += 1
         elif key in (10, 13):
-            return selected_index + 1
+            return selected_index
         elif key == 27:  # ESC
             return None
 
@@ -306,16 +308,51 @@ def audio_stream_worker():
             time.sleep(1)
 
 # =============== SPEAK ===============
-def speak(text):
+def map_range(val, in_min, in_max, out_min, out_max):
+    """
+    Linearly map a value from one range to another.
+    Clamps to out_min/out_max if val is outside in_min/in_max.
+    """
+    if in_max == in_min:
+        return out_min  # avoid division by zero
+    # Normalize into 0–1
+    ratio = (val - in_min) / (in_max - in_min)
+    # Clamp ratio
+    ratio = max(0.0, min(1.0, ratio))
+    # Scale into output range
+    return out_min + ratio * (out_max - out_min)
+
+def extract_prosody(audio_np, sr=16000):
+    try:
+        pitches, magnitudes = librosa.piptrack(y=audio_np, sr=sr)
+        pitch = float(np.mean(pitches[pitches > 0])) if np.any(pitches > 0) else 0
+        energy = float(np.mean(librosa.feature.rms(y=audio_np)))
+        tempo, _ = librosa.beat.beat_track(y=audio_np, sr=sr)
+        return {"pitch": pitch, "energy": energy, "tempo": tempo}
+    except Exception as e:
+        log(f"[prosody] Error extracting: {e}")
+        return {"pitch": 50, "energy": 0.05, "tempo": 120}
+
+def speak(text, prosody=None):
     try:
         if settings.get("speak", True):
-            proc = subprocess.Popen(["espeak", "-s", "150", "-d", "TTS_voice", text],
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL,
-                                    text=True)
+            pitch = 50
+            speed = 175
+            volume = 100
+
+
+            proc = subprocess.Popen(
+                ["espeak-ng", "-p", str(map_range(prosody['pitch'], -50, 800, 0, 100)), "-s", str(prosody['tempo'][0]+30), "-a", str(volume), "-d", "TTS_voice", text],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
+            log(["espeak-ng", "-p", str(map_range(prosody['pitch'], -50, 800, 0, 100)), "-s", str(prosody['tempo'][0]+30), "-a", str(volume), "-d", "TTS_voice", text])
             child_procs.append(proc)
     except Exception as e:
         log(f"[speak error] {e}")
+
+
 
 # =============== WHISPER ===============
 def load_model_async():
@@ -401,7 +438,8 @@ def transcribe_worker(model, transcript_win=None):
                           full_text = f"{timestamp} {text}"
                           transcript_log.append(full_text)
 
-                        speak(text)
+                        prosody = extract_prosody(audio_np)
+                        speak(text, prosody)
 
         except Exception as e:
             log(f"[transcribe] Error: {e}")
