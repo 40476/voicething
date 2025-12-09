@@ -3,6 +3,7 @@ import faulthandler
 
 from matplotlib import text
 faulthandler.enable()
+from mimic3_tts import Mimic3TTS
 import curses, time, librosa, queue, threading, numpy as np, textwrap, subprocess, signal, wave, tempfile, whisper, pyaudio, torch, os, json
 from datetime import datetime
 from dbus_next.aio import MessageBus
@@ -68,6 +69,7 @@ CHUNK = 4096
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
+tts = Mimic3TTS()
 
 # ================ SOUND PLAYBACK ================
 def play_sound(filename):
@@ -334,23 +336,33 @@ def extract_prosody(audio_np, sr=16000):
         return {"pitch": 50, "energy": 0.05, "tempo": 120}
 
 def speak(text, prosody=None):
-    try:
-        if settings.get("speak", True):
-            pitch = 50
-            speed = 175
-            volume = 100
+    if settings.get("speak", True):
+        try:
+            length_scale, noise_scale, noise_w = 1.0, 0.667, 0.8
+            if prosody:
+                length_scale, noise_scale, noise_w = map_prosody_to_mimic3(prosody)
+                log(f"[prosody→mimic3] length_scale={length_scale:.2f}, noise_scale={noise_scale:.2f}, noise_w={noise_w:.2f}")
 
+            # Initialize Mimic3 with prosody-driven params
+            tts = Mimic3TTS(length_scale=length_scale,
+                            noise_scale=noise_scale,
+                            noise_w=noise_w)
 
+            # Generate audio (numpy array)
+            audio = tts.speak(text)
+
+            # Pipe audio directly to TTS_voice sink
             proc = subprocess.Popen(
-                ["espeak-ng", "-p", str(map_range(prosody['pitch'], -50, 800, 0, 100)), "-s", str(prosody['tempo'][0]+30), "-a", str(volume), "-d", "TTS_voice", text],
+                ["pacat", "--client-name=TonePlayer", "--device=TTS_voice"],
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True
+                stderr=subprocess.DEVNULL
             )
-            log(["espeak-ng", "-p", str(map_range(prosody['pitch'], -50, 800, 0, 100)), "-s", str(prosody['tempo'][0]+30), "-a", str(volume), "-d", "TTS_voice", text])
-            child_procs.append(proc)
-    except Exception as e:
-        log(f"[speak error] {e}")
+            proc.stdin.write(audio.tobytes())
+            proc.stdin.close()
+
+        except Exception as e:
+            log(f"[speak error] {e}")
 
 
 
