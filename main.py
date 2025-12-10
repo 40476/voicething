@@ -1,10 +1,7 @@
 #!/usr/bin/python3
 import faulthandler
-
-from matplotlib import text
 faulthandler.enable()
-from mimic3_tts import Mimic3TTS
-import curses, time, librosa, queue, threading, numpy as np, textwrap, subprocess, signal, wave, tempfile, whisper, pyaudio, torch, os, json
+import curses, time, librosa, queue, threading, numpy as np, textwrap, subprocess, signal, wave, tempfile, whisper, pyaudio, torch, os, json, resampy
 from datetime import datetime
 from dbus_next.aio import MessageBus
 from dbus_next.service import ServiceInterface, method
@@ -19,10 +16,12 @@ SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
 
 # =============== DEFAULT SETTINGS ===============
 default_settings = {
-    "model": "small",
-    "language": "en",
+    "whisper_model": "small",
+    "whisper_language": "en",
+    "voice_model": "en_US/hifi-tts_low",
     "audio_device": None,
-    "speak": True,
+    "tts_enabled": True,
+    "prosody_enabled": True,
     "sound_emojis": {}
 }
 
@@ -69,7 +68,7 @@ CHUNK = 4096
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-tts = Mimic3TTS()
+
 
 # ================ SOUND PLAYBACK ================
 def play_sound(filename):
@@ -182,7 +181,7 @@ class PTTInterface(ServiceInterface):
         super().__init__('com.speak.PTT')
 
     @method()
-    def Toggle(self) -> 's':
+    def Toggle(self) -> "s": # this fine dont touch it it works idk why or how
         settings["ptt_active"] = not settings.get("ptt_active", False)
         volume_path = os.path.expanduser("~/.local/state/speakvolumerc")
         if settings["ptt_active"]:
@@ -190,7 +189,7 @@ class PTTInterface(ServiceInterface):
             subprocess.call("amixer set Master 20%", shell=True)
             play_tone(600, 0.3)  # Start tone
         else:
-            subprocess.call(f"amixer set Master $(cat {volume_path})",shell=True)
+            subprocess.call(f"amixer set Master $(cat {volume_path})", shell=True)
             play_tone(440, 0.2)  # Processing tone
         log(f"[ptt] {'Activated' if settings['ptt_active'] else 'Deactivated'}")
         return "PTT toggled"
@@ -335,43 +334,74 @@ def extract_prosody(audio_np, sr=16000):
         log(f"[prosody] Error extracting: {e}")
         return {"pitch": 50, "energy": 0.05, "tempo": 120}
 
+def map_prosody_to_mimic3(prosody):
+    if settings.get("prosody_enabled", True) is False:
+        return 1.0, 1.0, 1.0  # Default params if prosody disabled
+    # Expect prosody dict with keys: pitch (Hz), energy, tempo (BPM)
+
+    raw_pitch = prosody.get("pitch", 150)
+    raw_energy = prosody.get("energy", 0.05)
+    raw_tempo = prosody.get("tempo", 120)
+
+    # Map pitch into noise_w (prosody randomness)
+    noise_w = map_range(raw_pitch, 80, 400, 0.5, 1.2)
+
+    # Map energy into noise_scale (expressiveness)
+    noise_scale = map_range(raw_energy, 0.01, 0.1, 0.5, 1.0)
+
+    # Map tempo into length_scale (speaking rate)
+    length_scale = map_range(raw_tempo, 60, 200, 0.8, 1.2)
+
+    return length_scale, noise_scale, noise_w
+
 def speak(text, prosody=None):
-    if settings.get("speak", True):
+    if settings.get("tts_enabled", True):
         try:
-            length_scale, noise_scale, noise_w = 1.0, 0.667, 0.8
-            if prosody:
+            # Default prosody-driven params
+            length_scale, noise_scale, noise_w = 1.0, 1.0, 1.0
+            if prosody :
                 length_scale, noise_scale, noise_w = map_prosody_to_mimic3(prosody)
-                log(f"[prosody→mimic3] length_scale={length_scale:.2f}, noise_scale={noise_scale:.2f}, noise_w={noise_w:.2f}")
+                # Invert length_scale for Mimic3
+                length_scale, noise_scale, noise_w = str(2-(float(length_scale)**2)), str(noise_scale), str(noise_w)
+                log(f"[prosody] length_scale={float(length_scale)}, "
+                        f"noise_scale={noise_scale}, noise_w={noise_w}")
+            
+            # Build CLI command
+            cmd = [
+                "python3", "-m", "mimic3_tts",
+                "--voice", settings["voice_model"],
+                "--noise-scale", noise_scale,
+                "--length-scale", length_scale,
+                "--noise-w", str(0),
+                text
+            ]
 
-            # Initialize Mimic3 with prosody-driven params
-            tts = Mimic3TTS(length_scale=length_scale,
-                            noise_scale=noise_scale,
-                            noise_w=noise_w)
-
-            # Generate audio (numpy array)
-            audio = tts.speak(text)
-
-            # Pipe audio directly to TTS_voice sink
+            log(f"[TTS] Built command: {' '.join(cmd)}")
+            # Pipe directly into pacat
             proc = subprocess.Popen(
-                ["pacat", "--client-name=TonePlayer", "--device=TTS_voice"],
-                stdin=subprocess.PIPE,
+                cmd + ["--stdout"],  # dump WAV to stdout
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+            pacat = subprocess.Popen(
+                ["pacat", "--client-name=TonePlayer", "--device=TTS_voice",
+                  "--rate=22050", "--channels=1", "--format=s16le"],
+                stdin=proc.stdout,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            proc.stdin.write(audio.tobytes())
-            proc.stdin.close()
+            pacat.communicate()
+            proc.wait()
 
         except Exception as e:
             log(f"[speak error] {e}")
-
-
 
 # =============== WHISPER ===============
 def load_model_async():
     global model
     try:
-        log(f"[model] Loading Whisper: {settings['model']}")
-        model = whisper.load_model(settings["model"])
+        log(f"[model] Loading Whisper: {settings['whisper_model']}")
+        model = whisper.load_model(settings["whisper_model"])
         model_ready.set()
         log("[model] Ready.")
     except Exception as e:
@@ -436,7 +466,7 @@ def transcribe_worker(model, transcript_win=None):
                         wf.setframerate(RATE)
                         wf.writeframes((audio_np * 32768).astype(np.int16).tobytes())
 
-                    result = model.transcribe(f.name, language=settings.get("language", "en"), fp16=True)
+                    result = model.transcribe(f.name, language=settings.get("whisper_language", "en"), fp16=True)
                     text = result.get("text", "").strip()
 
                     if text:
@@ -458,12 +488,16 @@ def transcribe_worker(model, transcript_win=None):
 
 # =============== UI ===============
 def update_settings(win):
+    """
+    Dynamically update the settings panel based on the current settings.
+    """
     win.clear()
     win.box()
     win.addstr(0, 2, " SETTINGS ")
     for i, key in enumerate(setting_keys):
         val = str(settings[key])
-        line = f"{key:<14}: {val}"
+        val_type = type(default_settings[key]).__name__
+        line = f"{key:<14} ({val_type}): {val}"
         if i == selected_index:
             win.attron(curses.A_REVERSE)
             win.addstr(i + 2, 2, line.ljust(40))
@@ -609,20 +643,37 @@ def update_command(win):
     win.clear()
     win.box()
     win.addstr(1, 2, " LAUNCH COMMAND ")
-    cmd = f"python3 main.py --model {settings['model']}"
+    cmd = f"python3 main.py --model {settings['whisper_model']}"
     win.addstr(2, 2, cmd[:win.getmaxyx()[1] - 4])
     win.refresh()
 
+def validate_and_cast(value, expected_type):
+    """
+    Validate and cast the input value to the expected type.
+    Raise ValueError if the value cannot be cast.
+    """
+    try:
+        if expected_type == bool:
+            # Special handling for booleans
+            if value.lower() in ("true", "1", "yes", "on"):
+                return True
+            elif value.lower() in ("false", "0", "no", "off"):
+                return False
+            else:
+                raise ValueError("Invalid boolean value")
+        return expected_type(value)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid value: {value}. Expected type: {expected_type.__name__}")
+
 def edit_setting(win):
+    """
+    Edit the selected setting, ensuring the value matches the expected type.
+    """
     global selected_index
     key = setting_keys[selected_index]
+    expected_type = type(default_settings[key])
 
-    if key == "speak":
-        settings["speak"] = not settings["speak"]
-        log(f"Speech {'enabled' if settings['speak'] else 'disabled'}")
-        save_config()
-
-    elif key == "audio_device":
+    if key == "audio_device":
         devices = list_audio_devices()
         dev_names = [f"{idx}: {name}" for idx, name in devices]
         try:
@@ -637,14 +688,14 @@ def edit_setting(win):
     else:
         curses.echo()
         prompt_y = len(setting_keys) + 3
-        win.addstr(prompt_y, 2, f"{key}: ")
-        val = win.getstr(prompt_y, len(key) + 4, 20).decode()
+        win.addstr(prompt_y, 2, f"{key} ({expected_type.__name__}): ")
+        val = win.getstr(prompt_y, len(key) + len(expected_type.__name__) + 5, 20).decode()
         curses.noecho()
         try:
-            settings[key] = float(val) if key == "buffer_seconds" else val
+            settings[key] = validate_and_cast(val, expected_type)
             log(f"[settings] {key} → {settings[key]}")
             save_config()
-        except Exception as e:
+        except ValueError as e:
             log(f"[settings] Error: {e}")
 
 def handle_sigint(sig, frame):
