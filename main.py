@@ -10,7 +10,7 @@ from pathlib import Path
 # =============== CONFIG PATHS ===============
 CONFIG_DIR = Path.home() / ".local/share/voicething"
 SOUNDS_DIR = CONFIG_DIR / "sounds"
-CONFIG_FILE = CONFIG_DIR / "voicething.conf"
+CONFIG_FILE = CONFIG_DIR / "voicething.json"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -22,7 +22,8 @@ default_settings = {
     "audio_device": None,
     "tts_enabled": True,
     "prosody_enabled": True,
-    "sound_emojis": {}
+    "sound_emojis": {},
+    "ptt_active": False,
 }
 
 # Load or create config
