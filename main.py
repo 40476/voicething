@@ -27,6 +27,8 @@ default_settings = {
     "prosody_enabled": True,
     "sound_emojis": {},
     "ptt_active": False,
+    "ydotool_once": False,
+    "ydotool_command": "ydotool type -f",
 }
 
 # Load or create config
@@ -62,6 +64,7 @@ log_scroll = 0
 MAX_LOG_LINES = 100
 audio_q = queue.Queue()
 log_q = queue.Queue()
+config_mtime = 0  # Track config file modification time
 
 # --- TTS PIPELINE QUEUES ---
 tts_text_queue = queue.Queue()  # Holds (text, prosody_params)
@@ -281,7 +284,7 @@ class PTTInterface(ServiceInterface):
         super().__init__('com.speak.PTT')
 
     @method()
-    def Toggle(self) -> "s":
+    def Toggle(self):
         settings["ptt_active"] = not settings.get("ptt_active", False)
         volume_path = os.path.expanduser("~/.local/state/speakvolumerc")
         if settings["ptt_active"]:
@@ -297,6 +300,19 @@ class PTTInterface(ServiceInterface):
         log(f"[ptt] {'Activated' if settings['ptt_active'] else 'Deactivated'}")
         return "PTT toggled"
 
+class YDToolInterface(ServiceInterface):
+    def __init__(self):
+        super().__init__('com.speak.YDTool')
+
+    @method()
+    def End(self):
+        # End PTT cycle and use ydotool for this one call
+        settings["ptt_active"] = False
+        settings["ydotool_once"] = True
+        play_tone(440, 0.2)
+        log("[ydotool] End PTT cycle, use ydotool for next call")
+        return "PTT cycle ended, ydotool will be used for next call"
+
 def start_ptt_listener():
     import asyncio
     async def runner():
@@ -304,7 +320,9 @@ def start_ptt_listener():
             bus = await MessageBus().connect()
             interface = PTTInterface()
             bus.export('/com/speak/PTT', interface)
+            bus.export('/com/speak/YDTool', YDToolInterface())
             await bus.request_name('com.speak.PTT')
+            await bus.request_name('com.speak.YDTool')
             log("[DBus] PTT service running...")
             await asyncio.get_event_loop().create_future()
         except Exception as e:
@@ -459,7 +477,7 @@ class DownloadProgressBar:
         if s:
             download_status = s
         return len(s)
-    def flush(self): pass
+    def flush(self) -> None: pass
 
 def load_model_async():
     global model, download_status
@@ -546,27 +564,69 @@ def transcribe_worker(model):
 
                         transcript_log.append(full_text)
                         
-                        # Push to queue instead of waiting for speak()
-                        tts_text_queue.put((text, prosody))
+                        # Check if ydotool is enabled or ydotool_once flag is set
+                        if settings.get("ydotool_once", False):
+                            # Send text to ydotool instead of TTS
+                            try:
+                                ydotool_cmd = settings.get("ydotool_command", "ydotool type -f")
+                                # Use a safer approach - write to a temp file and read it
+                                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                                    f.write(text)
+                                    temp_file = f.name
+                                
+                                # Use ydotool to type the file contents
+                                subprocess.Popen(f"{ydotool_cmd} {temp_file}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                # Clean up temp file
+                                subprocess.Popen(f"sleep 0.5 && rm -f {temp_file}", shell=True)
+                                log(f"[ydotool] Typed: {text[:30]}...")
+                                
+                                # Clear the ydotool_once flag after use
+                                settings["ydotool_once"] = False
+                            except Exception as e:
+                                log(f"[ydotool] Error: {e}")
+                        else:
+                            # Normal TTS processing
+                            tts_text_queue.put((text, prosody))
 
         except Exception as e:
             log(f"[transcribe] Error: {e}")
 
 # =============== UI ===============
 def update_settings(win):
+    global selected_index, sound_scroll
     win.clear()
     win.box()
     win.addstr(0, 2, " SETTINGS ")
-    for i, key in enumerate(setting_keys):
+    
+    h, w = win.getmaxyx()
+    visible_height = h - 2
+    
+    # Ensure selected_index is within bounds
+    selected_index = max(0, min(selected_index, len(setting_keys) - 1))
+    
+    # Calculate scroll offset to keep selection visible
+    if selected_index < sound_scroll:
+        sound_scroll = selected_index
+    elif selected_index >= sound_scroll + visible_height:
+        sound_scroll = selected_index - visible_height + 1
+    sound_scroll = max(0, min(sound_scroll, max(0, len(setting_keys) - visible_height)))
+    
+    # Render visible settings
+    for i in range(visible_height):
+        idx = sound_scroll + i
+        if idx >= len(setting_keys): break
+            
+        key = setting_keys[idx]
         val = str(settings[key])
         val_type = type(default_settings[key]).__name__
         line = f"{key:<14} ({val_type}): {val}"
-        if i == selected_index:
-            win.attron(curses.A_REVERSE)
-            win.addstr(i + 2, 2, line.ljust(40))
-            win.attroff(curses.A_REVERSE)
-        else:
-            win.addstr(i + 2, 2, line.ljust(40))
+        
+        is_selected = idx == selected_index
+        color_id = 2 if is_selected else 1
+        win.attrset(curses.color_pair(color_id))
+        
+        win.addstr(i + 1, 2, line[:w - 4])
+    
     win.refresh()
 
 def update_logs(win):
@@ -696,6 +756,53 @@ def validate_and_cast(value, expected_type):
     except:
         raise ValueError(f"Invalid type, expected {expected_type.__name__}")
 
+def edit_setting_popup(key, expected_type):
+    """Create a centered popup dialog for editing settings"""
+    curses.curs_set(1)  # Show cursor
+    curses.echo()
+    
+    try:
+        # Create popup dimensions
+        popup_h = 7
+        popup_w = 60
+        h, w = curses.LINES, curses.COLS
+        start_y = (h - popup_h) // 2
+        start_x = (w - popup_w) // 2
+        
+        # Create popup window
+        popup = curses.newwin(popup_h, popup_w, start_y, start_x)
+        popup.border()
+        popup.addstr(0, 2, f" EDIT {key.upper()} ")
+        
+        # Display current value
+        current_val = str(settings[key])
+        popup.addstr(2, 2, f"Current: {current_val}")
+        
+        # Input prompt
+        prompt = f"New value ({expected_type.__name__}): "
+        popup.addstr(4, 2, prompt)
+        popup.refresh()
+        
+        # Get input with appropriate length
+        max_input_len = 50 if expected_type == str else 20
+        input_start_x = 2 + len(prompt)
+        
+        val = popup.getstr(4, input_start_x, max_input_len).decode()
+        
+        # Validate and save
+        if val.strip():
+            settings[key] = validate_and_cast(val, expected_type)
+            save_config()
+            log(f"Updated {key} to: {val}")
+        else:
+            log(f"No change made to {key}")
+            
+    except Exception as e:
+        log(f"Setting Error: {e}")
+    finally:
+        curses.noecho()
+        curses.curs_set(0)
+
 def edit_setting(win):
     global selected_index
     key = setting_keys[selected_index]
@@ -711,19 +818,11 @@ def edit_setting(win):
                 save_config()
         except: pass
     else:
-        curses.echo()
-        prompt_y = len(setting_keys) + 3
-        win.addstr(prompt_y, 2, f"{key} ({expected_type.__name__}): ")
-        try:
-            val = win.getstr(prompt_y, len(key) + len(expected_type.__name__) + 5, 20).decode()
-            settings[key] = validate_and_cast(val, expected_type)
-            save_config()
-        except Exception as e:
-            log(f"Setting Error: {e}")
-        curses.noecho()
+        # Use popup dialog for all non-device settings
+        edit_setting_popup(key, expected_type)
 
 def main(stdscr):
-    global selected_index, log_scroll, should_run
+    global selected_index, log_scroll, should_run, config_mtime
     global soundboard_visible, sound_selected, sound_files
     
     def final_cleanup():
@@ -741,7 +840,33 @@ def main(stdscr):
                 p.wait(timeout=1)
             except: pass
 
+    def check_config_reload():
+        """Check if config file has been modified and reload if needed"""
+        global config_mtime, settings, setting_keys
+        try:
+            current_mtime = CONFIG_FILE.stat().st_mtime
+            if current_mtime > config_mtime:
+                config_mtime = current_mtime
+                # Reload config
+                with open(CONFIG_FILE, 'r') as f:
+                    new_settings = json.load(f)
+                # Merge with defaults
+                for key in default_settings:
+                    if key not in new_settings:
+                        new_settings[key] = default_settings[key]
+                settings.update(new_settings)
+                setting_keys = list(settings.keys())
+                log("[config] Reloaded settings from file")
+        except Exception as e:
+            pass  # Ignore errors during config reload
+
     signal.signal(signal.SIGINT, lambda s, f: final_cleanup())
+    
+    # Initialize config mtime
+    try:
+        config_mtime = CONFIG_FILE.stat().st_mtime
+    except:
+        config_mtime = 0
     
     curses.curs_set(0)
     curses.start_color()
@@ -783,9 +908,16 @@ def main(stdscr):
     stdscr.timeout(100)
     
     transcriber_started = False
+    config_check_counter = 0
 
     try:
         while should_run:
+            # Check config file every 10 iterations (~1 second)
+            config_check_counter += 1
+            if config_check_counter >= 10:
+                check_config_reload()
+                config_check_counter = 0
+
             if soundboard_visible:
                 t_h = h // 2
                 transcript_win.resize(t_h, w - half)
