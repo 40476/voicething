@@ -3,24 +3,22 @@ import faulthandler
 faulthandler.enable()
 import os
 
-# =============== HARDWARE FIX FOR AMD GPU ===============
-# These MUST be set before importing torch or faster-whisper to prevent CTranslate2 segfaults
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["HIP_VISIBLE_DEVICES"] = ""
-os.environ["ROCR_VISIBLE_DEVICES"] = ""
-# Unleash the CPU threads!
-os.environ["OMP_NUM_THREADS"] = "88"
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import curses, time, librosa, queue, threading, numpy as np, textwrap, subprocess, signal, wave, tempfile, whisper, pyaudio, torch, json, resampy, contextlib, sys
 from datetime import datetime
 from pathlib import Path
 from gtts import gTTS
+from dbus_next.aio import MessageBus
+from dbus_next.service import ServiceInterface, method
 
 try:
     import vosk
 except ImportError:
     vosk = None
+
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
 
 # =============== CONFIG PATHS ===============
 CONFIG_DIR = Path.home() / ".local/share/voicething"
@@ -36,14 +34,16 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 default_settings = {
     "whisper_model": "small",
     "whisper_language": "en",
-    "whisper_backend": "local_openai_whisper", # Options: local_openai_whisper, vosk
-    "whisper_device": "cpu",        
-    "whisper_compute_type": "int8", 
+    "whisper_backend": "local_openai_whisper", # Options: local_openai_whisper, vosk, google_speech
+    "whisper_device": "cuda",        
+    "whisper_compute_type": "float16", 
+    "vosk_model": "vosk-model-en-us-0.22",  # Upgraded to use the massive 1.8GB model
     "voice_model": "en_US/hifi-tts_low",
     "audio_device": None,           # Microphone Input
     "loopback_device": None,        # System Audio Monitor (for AEC)
     "aec_enabled": True,            # Internal Algorithmic Echo Cancellation
-    "aec_aggressiveness": 2.0,      # Multiplier for subtraction (higher = more aggressive)
+    "aec_aggressiveness": 5.0,      # Multiplier for subtraction (higher = more aggressive)
+    "aec_hard_gate": True,          # Aggressively squash mic when system audio is loud
     "tts_enabled": True,
     "prosody_enabled": True,
     "sound_emojis": {},
@@ -51,7 +51,11 @@ default_settings = {
     "vox_enabled": True,            
     "vox_threshold": 0.015,         
     "vox_silence_duration": 0.5,    
-    "echo_cancellation_delay": 0.5, # App-level TTS ducking safety net
+    "echo_cancellation_delay": 1.5, # Increased default to account for OS-level buffer drain
+    "ptt_mode": False,              # If True, only transcribe when PTT is active
+    "ptt_active": False,
+    "ydotool_once": False,
+    "ydotool_command": "ydotool type -f",
 }
 
 # Load or create config
@@ -72,7 +76,6 @@ setting_keys = list(settings.keys())
 selected_index = 0
 settings_scroll = 0
 should_run = True
-torch.backends.cudnn.enabled = False
 
 # =============== SOUNDBOARD STATE ===============
 soundboard_visible = True
@@ -98,7 +101,7 @@ tts_audio_queue = queue.Queue() # Holds raw wav bytes
 child_procs = []
 model_ready = threading.Event()
 model = None
-engine = None  # Global engine reference (Vosk or WLK)
+engine = None  # Global engine reference (Vosk, Google, or WLK)
 download_status = "" # For tracking download progress
 
 # Global PyAudio instance to prevent termination segfaults
@@ -451,9 +454,10 @@ def edit_setting(win):
         elif key == "vox_silence_duration":
             settings[key] = round(val + 0.5 if val < 3.0 else 0.5, 1)
         elif key == "aec_aggressiveness":
-            settings[key] = round(val + 0.5 if val < 10.0 else 0.5, 1)
+            settings[key] = round(val + 0.5 if val < 20.0 else 0.5, 1)
         elif key == "echo_cancellation_delay":
-            settings[key] = round(val + 0.1 if val < 2.0 else 0.1, 1)
+            # Extended limit to 5.0s to allow pulse audio buffer drain
+            settings[key] = round(val + 0.1 if val < 5.0 else 0.1, 1)
         save_config()
         log(f"[config] {key} -> {settings[key]}")
     elif key in ["whisper_device", "whisper_compute_type", "whisper_backend"]:
@@ -463,7 +467,7 @@ def edit_setting(win):
         elif key == "whisper_compute_type":
             settings[key] = "float16" if val == "int8" else "int8"
         elif key == "whisper_backend":
-            backends = ["local_openai_whisper", "vosk"]
+            backends = ["local_openai_whisper", "vosk", "google_speech"]
             current_idx = backends.index(val) if val in backends else 0
             settings[key] = backends[(current_idx + 1) % len(backends)]
         save_config()
@@ -481,6 +485,55 @@ def edit_setting(win):
 def edit_sound_emoji(idx):
     if 0 <= idx < len(sound_files):
         log(f"[emoji] Select emoji functionality not implemented for {sound_files[idx]}")
+
+# =============== PTT VIA DBUS ===============
+class PTTInterface(ServiceInterface):
+    def __init__(self):
+        super().__init__('com.speak.PTT')
+
+    @method()
+    def Toggle(self):
+        settings["ptt_active"] = not settings.get("ptt_active", False)
+        volume_path = os.path.expanduser("~/.local/state/speakvolumerc")
+        if settings["ptt_active"]:
+            subprocess.call(f"echo -n \"$(awk -F'[][]' '/Left:/ {{ print $2 }}' <(amixer sget Master))\" > {volume_path}", shell=True, executable="/bin/bash")
+            subprocess.call("amixer set Master 20%", shell=True)
+            play_tone(600, 0.3)
+        else:
+            if os.path.exists(volume_path):
+                subprocess.call(f"amixer set Master $(cat {volume_path})", shell=True)
+            play_tone(440, 0.2)
+        log(f"[ptt] {'Activated' if settings['ptt_active'] else 'Deactivated'}")
+        return "PTT toggled"
+
+class YDToolInterface(ServiceInterface):
+    def __init__(self):
+        super().__init__('com.speak.YDTool')
+
+    @method()
+    def End(self):
+        settings["ptt_active"] = False
+        settings["ydotool_once"] = True
+        play_tone(440, 0.2)
+        log("[ydotool] End PTT cycle, use ydotool for next call")
+        return "PTT cycle ended, ydotool will be used for next call"
+
+def start_ptt_listener():
+    import asyncio
+    async def runner():
+        try:
+            bus = await MessageBus().connect()
+            interface = PTTInterface()
+            bus.export('/com/speak/PTT', interface)
+            bus.export('/com/speak/YDTool', YDToolInterface())
+            await bus.request_name('com.speak.PTT')
+            await bus.request_name('com.speak.YDTool')
+            log("[DBus] PTT service running...")
+            await asyncio.get_event_loop().create_future()
+        except Exception as e:
+            log(f"[DBus] Error: {e}")
+
+    threading.Thread(target=lambda: asyncio.run(runner()), daemon=True).start()
 
 def list_audio_devices():
     # Use the global PyAudio instance, do NOT terminate it.
@@ -541,15 +594,27 @@ def audio_stream_worker():
     is_recording = False
     audio_buffer = []
     silence_chunks = 0
+    
+    # AEC Memory buffer to handle room echo delay
+    ref_mag_history = []
 
     while should_run:
         try:
             mic_id = settings.get("audio_device")
             ref_id = settings.get("loopback_device")
             aec_enabled = settings.get("aec_enabled", True)
+            backend = settings.get("whisper_backend", "local_openai_whisper")
 
             if mic_id is None:
                 time.sleep(1)
+                continue
+                
+            # ==== PTT GATE ====
+            if settings.get("ptt_mode", False) and not settings.get("ptt_active", False):
+                is_recording = False
+                audio_buffer = []
+                silence_chunks = 0
+                time.sleep(0.1)
                 continue
 
             # Handle Microphone Stream Restarts
@@ -613,6 +678,14 @@ def audio_stream_worker():
                     ref_data = ref_stream.read(CHUNK, exception_on_overflow=False)
                     ref_np = np.frombuffer(ref_data, dtype=np.int16).astype(np.float32)
                     
+                    # Calculate volume of the system audio
+                    ref_rms = np.sqrt(np.mean((ref_np / 32768.0)**2) + 1e-6)
+
+                    # Hard Gate: If system audio is playing loudly, squash the mic drastically before math
+                    # Threshold lowered to catch quieter sounds, and mic is squashed to 1%
+                    if settings.get("aec_hard_gate", True) and ref_rms > 0.002:
+                        mic_np *= 0.01 
+                    
                     # 1. Fast Fourier Transform (Time Domain -> Frequency Domain)
                     mic_fft = np.fft.rfft(mic_np)
                     ref_fft = np.fft.rfft(ref_np)
@@ -622,9 +695,20 @@ def audio_stream_worker():
                     ref_mag = np.abs(ref_fft)
                     mic_phase = np.angle(mic_fft)
 
-                    # 3. Spectral Subtraction (Erase Discord/System audio from Mic)
-                    aggressiveness = settings.get("aec_aggressiveness", 2.0)
-                    clean_mag = mic_mag - (aggressiveness * ref_mag)
+                    # Keep a rolling history to account for room delay/reverb (extended to ~1.5s)
+                    ref_mag_history.append(ref_mag)
+                    if len(ref_mag_history) > 6: 
+                        ref_mag_history.pop(0)
+                        
+                    # Use the loudest frequencies from recent history
+                    max_ref_mag = np.max(ref_mag_history, axis=0)
+
+                    # 3. Aggressive Spectral Subtraction
+                    aggressiveness = settings.get("aec_aggressiveness", 5.0)
+                    clean_mag = mic_mag - (aggressiveness * max_ref_mag)
+                    
+                    # Apply residual noise gate (hard erase if it still sounds like system audio)
+                    clean_mag[clean_mag < (aggressiveness * 0.2 * max_ref_mag)] = 0.0
                     clean_mag = np.maximum(clean_mag, 0.0) # Prevent negative magnitudes
 
                     # 4. Inverse FFT (Frequency Domain -> Clean Time Domain)
@@ -637,18 +721,20 @@ def audio_stream_worker():
                 with playback_lock:
                     currently_playing = active_playbacks > 0
                 
-                delay = settings.get("echo_cancellation_delay", 0.5)
+                delay = settings.get("echo_cancellation_delay", 1.5)
                 if currently_playing or (time.time() - last_playback_end < delay):
                     if is_recording:
                         log("[VOX] Muted mic during app playback.")
                         is_recording = False
                         audio_buffer = []
                         silence_chunks = 0
-                    continue # Drop frame
+                    
+                    # To prevent VOSK from time-jumping, feed it silent bytes while ducking
+                    if backend == "vosk":
+                        audio_q.put(b'\x00' * len(mic_data))
+                    continue # Drop active frame
                 
                 # ==== STANDARD VOX PROCESSING ====
-                backend = settings.get("whisper_backend", "local_openai_whisper")
-                
                 # Convert cleaned numpy array back to bytes for Vosk/Whisper
                 clean_bytes = clean_np.astype(np.int16).tobytes()
 
@@ -738,14 +824,28 @@ def load_models_sync():
             
         try:
             log("[model] Loading Vosk streaming model...")
-            # Automatically downloads the lightweight language model if not present
             vosk.SetLogLevel(-1) # Hide annoying logs
-            model = vosk.Model(lang="en-us")
+            # Allow user to specify massive models if they downloaded them, else default
+            model_name = settings.get("vosk_model", "vosk-model-en-us-0.22")
+            try:
+                model = vosk.Model(model_name=model_name)
+            except Exception as inner_e:
+                log(f"[model] Large model '{model_name}' failed, falling back to small 'en-us'.")
+                model = vosk.Model(lang="en-us")
+                
             engine = vosk.KaldiRecognizer(model, RATE)
             log("[model] Vosk live streaming ready.")
         except Exception as e:
             log(f"[model] Vosk init failed: {e}")
             download_status = f"Vosk Error: {str(e)[:40]}"
+            
+    elif backend_choice == "google_speech":
+        if sr is None:
+            log("[model] ERROR: SpeechRecognition not installed. run: pip install SpeechRecognition")
+            download_status = "Error: pip install SpeechRecognition"
+        else:
+            engine = sr.Recognizer()
+            log("[model] Google Speech Recognition ready (requires internet).")
             
     else:
         log("[model] Loading native OpenAI Whisper...")
@@ -754,7 +854,7 @@ def load_models_sync():
                 model = whisper.load_model(
                     settings["whisper_model"], 
                     download_root=str(MODELS_DIR),
-                    device=settings.get("whisper_device", "cpu")
+                    device=settings.get("whisper_device", "cuda") # Try GPU by default since AMD overrides removed
                 )
             log("[model] Native Whisper ready.")
         except Exception as fallback_e:
@@ -790,6 +890,16 @@ def transcribe_worker():
                     partial = res.get("partial", "")
                     if partial:
                         live_partial_text = partial
+                        
+            elif backend_choice == "google_speech" and engine is not None and sr is not None:
+                # GOOGLE SPEECH RECOGNITION (Requires Internet)
+                audio_data = sr.AudioData(audio_bytes, RATE, 2)
+                try:
+                    transcription_text = engine.recognize_google(audio_data)
+                except sr.UnknownValueError:
+                    pass
+                except sr.RequestError as e:
+                    log(f"[Google STT] API Error: {e}")
             
             elif backend_choice == "local_openai_whisper" and model is not None:
                 # STANDARD WHISPER CHUNK PROCESSING
@@ -799,10 +909,60 @@ def transcribe_worker():
             
             if transcription_text and transcription_text.strip():
                 text = transcription_text.strip()
+                
+                # --- Vosk "the" hallucination filter ---
+                if backend_choice == "vosk":
+                    # Remove trailing/leading "the " which Vosk hallucinates on noise
+                    if text.lower().startswith("the ") and len(text) > 4:
+                        text = text[4:].strip()
+                    if text.lower().endswith(" the") and len(text) > 4:
+                        text = text[:-4].strip()
+                    if text.lower() == "the":
+                        text = ""
+                
+                if not text:
+                    audio_q.task_done()
+                    continue
+
+                # --- General Whisper Hallucination Filter ---
+                text_lower = text.lower().strip()
+                hallucinations = ["the", "the.", "you", "you.", "thanks for watching", "thanks for watching.", "thank you", "thank you.", "bye", "bye.", "a", "a."]
+                if text_lower in hallucinations or len(text) < 2:
+                    audio_q.task_done()
+                    continue
+                # ----------------------------
+
                 timestamp = datetime.now().strftime("[%H:%M:%S]")
                 log(f"[Rec] {text}")
                 transcript_log.append(f"{timestamp} {text}")
-                tts_text_queue.put((text, None))
+                
+                # Check for Ydotool DBus Trigger
+                if settings.get("ydotool_once", False):
+                    try:
+                        cmd = settings.get("ydotool_command", "ydotool type -f").split()
+                        
+                        # Safely route the output to ydotool via a temporary file to avoid shell quote errors
+                        with tempfile.NamedTemporaryFile('w', delete=False) as tf:
+                            tf.write(text)
+                            tmp_name = tf.name
+                            
+                        # If the user specifically configures '-f', feed the file
+                        if "-f" in cmd or "--file" in cmd:
+                            cmd.append(tmp_name)
+                        else:
+                            cmd.append(text)
+                            
+                        subprocess.run(cmd)
+                        os.unlink(tmp_name)
+                        log(f"[ydotool] Typed output directly to window.")
+                    except Exception as e:
+                        log(f"[ydotool] Error: {e}")
+                        
+                    # Reset the one-time trigger
+                    settings["ydotool_once"] = False
+                else:
+                    # Normal TTS Output
+                    tts_text_queue.put((text, None))
 
             audio_q.task_done()
 
@@ -887,6 +1047,8 @@ def main(stdscr):
     load_models_sync()
 
     # START SERVICES AND THREADS STRICTLY AFTER SYNCHRONOUS LOAD
+    start_ptt_listener()
+    
     t_audio = threading.Thread(target=audio_stream_worker, daemon=True)
     t_gen = threading.Thread(target=tts_subprocess_worker, daemon=True)
     t_play = threading.Thread(target=tts_playback_worker, daemon=True)
